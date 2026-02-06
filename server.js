@@ -179,7 +179,7 @@ app.get('/auth/google', (req, res) => {
   ];
 
   const authUrl = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
+    access_type: 'online',
     scope: scopes,
     prompt: 'consent' // Force consent to get refresh token
   });
@@ -318,7 +318,7 @@ app.post('/gmail/sync', async (req, res) => {
     // Fetch recent unread messages
     const response = await gmail.users.messages.list({
       userId: 'me',
-      q: 'is:unread in:inbox',
+      // q: 'is:unread in:inbox',
       maxResults
     });
 
