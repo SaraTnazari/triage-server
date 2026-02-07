@@ -62,12 +62,15 @@ app.use(express.json());
 
 /**
  * Check if a message already exists in the database (duplicate protection)
+ * Uses message_link (URL) to detect duplicates
  */
-async function isDuplicate(messageId, platform) {
+async function isDuplicate(messageLink, platform) {
+  if (!messageLink) return false;
+
   const { data, error } = await supabase
     .from('pending_actions')
     .select('id')
-    .eq('message_id', messageId)
+    .eq('message_link', messageLink)
     .eq('platform_tag', platform)
     .limit(1);
 
@@ -137,22 +140,22 @@ function parseSenderName(fromHeader) {
  * Save a message to Supabase
  */
 async function saveToSupabase({ sender, summary, url, platform, messageId }) {
-  // Check for duplicates first
-  if (await isDuplicate(messageId, platform)) {
-    console.log(`⏭️  Skipping duplicate: ${messageId}`);
+  // Check for duplicates first (using message_link/URL)
+  if (await isDuplicate(url, platform)) {
+    console.log(`⏭️  Skipping duplicate: ${url}`);
     return { skipped: true, reason: 'duplicate' };
   }
 
-  // Combine sender and summary into task_text with magic link
-  const task_text = `${sender}: ${summary}${url ? ` [Open](${url})` : ''}`;
+  // Combine sender and summary into task_text
+  const task_text = `${sender}: ${summary}`;
 
   const { data, error } = await supabase
     .from('pending_actions')
     .insert([{
       task_text,
       platform_tag: platform,
-      url,
-      message_id: messageId
+      sender_name: sender,
+      message_link: url
     }])
     .select();
 
