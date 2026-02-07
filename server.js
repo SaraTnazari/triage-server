@@ -376,7 +376,7 @@ app.post('/gmail/sync', async (req, res) => {
     // Fetch recent messages from inbox
     const response = await gmail.users.messages.list({
       userId: 'me',
-      q: 'in:inbox',
+      labelIds: ['INBOX'],
       maxResults
     });
 
