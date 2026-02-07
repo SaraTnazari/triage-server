@@ -39,6 +39,52 @@ if (process.env.GMAIL_REFRESH_TOKEN) {
 
 const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
+// ============================================
+// EMAIL FILTER CONFIGURATION
+// ============================================
+// Add domains/emails you want to ALWAYS see (VIP list)
+// Examples: '@yourcompany.com', 'boss@gmail.com', 'client@important.com'
+const VIP_SENDERS = [
+  // '@yourcompany.com',  // Uncomment and edit to add your work domain
+  // 'important@person.com',  // Uncomment and add specific emails
+];
+
+// Gmail labels to EXCLUDE (promotional/spam categories)
+// These are Gmail's category labels - emails with these labels will be filtered out
+const EXCLUDED_LABELS = [
+  'CATEGORY_PROMOTIONS',
+  'CATEGORY_SOCIAL',
+  'CATEGORY_UPDATES',
+  'CATEGORY_FORUMS',
+  'SPAM',
+  'TRASH'
+];
+
+/**
+ * Check if an email should be included in triage
+ * Returns true if: sender is VIP OR email is in Primary inbox (not promotions/social/etc)
+ */
+function shouldIncludeEmail(senderEmail, labelIds = []) {
+  // Always include VIP senders
+  const senderLower = (senderEmail || '').toLowerCase();
+  for (const vip of VIP_SENDERS) {
+    if (vip && senderLower.includes(vip.toLowerCase())) {
+      return true;
+    }
+  }
+
+  // Exclude if email has any of the excluded labels (promotions, social, etc)
+  for (const excludedLabel of EXCLUDED_LABELS) {
+    if (labelIds.includes(excludedLabel)) {
+      console.log(`⏭️  Filtered out (${excludedLabel}): ${senderEmail}`);
+      return false;
+    }
+  }
+
+  // Include if it's in INBOX and passed the label filter
+  return labelIds.includes('INBOX');
+}
+
 const app = express();
 
 // CORS - Allow requests from Chrome extension and any origin
@@ -286,13 +332,20 @@ app.post('/gmail/webhook', async (req, res) => {
           metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
         });
 
+        const labelIds = message.data.labelIds || [];
+
         // Only process unread messages in inbox
-        if (!message.data.labelIds?.includes('UNREAD')) {
+        if (!labelIds.includes('UNREAD')) {
           continue;
         }
 
         const headers = extractEmailHeaders(message.data);
         const senderName = parseSenderName(headers.from);
+
+        // Apply email filter (skip promotions, social, etc.)
+        if (!shouldIncludeEmail(headers.from, labelIds)) {
+          continue;
+        }
 
         await saveToSupabase({
           sender: senderName,
@@ -314,20 +367,22 @@ app.post('/gmail/webhook', async (req, res) => {
 /**
  * POST /gmail/sync
  * Manually sync recent unread emails (useful for testing)
+ * Filters out promotional/social emails, only shows Primary inbox + VIP senders
  */
 app.post('/gmail/sync', async (req, res) => {
   try {
     const { maxResults = 10 } = req.body;
 
-    // Fetch recent unread messages
+    // Fetch recent messages from inbox
     const response = await gmail.users.messages.list({
       userId: 'me',
-      // q: 'is:unread in:inbox',
+      q: 'in:inbox',
       maxResults
     });
 
     const messages = response.data.messages || [];
     const results = [];
+    let filtered = 0;
 
     for (const msg of messages) {
       const message = await gmail.users.messages.get({
@@ -339,6 +394,13 @@ app.post('/gmail/sync', async (req, res) => {
 
       const headers = extractEmailHeaders(message.data);
       const senderName = parseSenderName(headers.from);
+      const labelIds = message.data.labelIds || [];
+
+      // Apply email filter (skip promotions, social, etc.)
+      if (!shouldIncludeEmail(headers.from, labelIds)) {
+        filtered++;
+        continue;
+      }
 
       const result = await saveToSupabase({
         sender: senderName,
@@ -358,6 +420,8 @@ app.post('/gmail/sync', async (req, res) => {
     res.json({
       success: true,
       processed: results.length,
+      filtered: filtered,
+      message: `Added ${results.length} emails, filtered out ${filtered} promotional/social`,
       results
     });
   } catch (error) {
