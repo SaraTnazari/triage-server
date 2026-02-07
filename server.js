@@ -68,7 +68,7 @@ async function isDuplicate(messageId, platform) {
     .from('pending_actions')
     .select('id')
     .eq('message_id', messageId)
-    .eq('platform', platform)
+    .eq('platform_tag', platform)
     .limit(1);
 
   if (error) {
@@ -143,15 +143,16 @@ async function saveToSupabase({ sender, summary, url, platform, messageId }) {
     return { skipped: true, reason: 'duplicate' };
   }
 
+  // Combine sender and summary into task_text with magic link
+  const task_text = `${sender}: ${summary}${url ? ` [Open](${url})` : ''}`;
+
   const { data, error } = await supabase
     .from('pending_actions')
     .insert([{
-      sender,
-      summary,
+      task_text,
+      platform_tag: platform,
       url,
-      platform,
-      message_id: messageId,
-      created_at: new Date().toISOString()
+      message_id: messageId
     }])
     .select();
 
@@ -160,7 +161,7 @@ async function saveToSupabase({ sender, summary, url, platform, messageId }) {
     throw error;
   }
 
-  console.log(`✅ Saved: ${sender} - ${summary.substring(0, 50)}...`);
+  console.log(`✅ Saved: ${task_text.substring(0, 60)}...`);
   return { data, skipped: false };
 }
 
