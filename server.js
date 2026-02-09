@@ -21,6 +21,7 @@ import crypto from 'crypto';
 // CONFIGURATION
 // ============================================
 const PORT = process.env.PORT || 3000;
+const USER_ID = process.env.USER_ID; // Your Supabase user ID for automation
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
 // Gmail OAuth2 client setup
@@ -201,7 +202,8 @@ async function saveToSupabase({ sender, summary, url, platform, messageId }) {
       task_text,
       platform_tag: platform,
       sender_name: sender,
-      message_link: url
+      message_link: url,
+      user_id: USER_ID
     }])
     .select();
 
