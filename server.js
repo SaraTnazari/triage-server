@@ -22,7 +22,8 @@ import crypto from 'crypto';
 // ============================================
 const PORT = process.env.PORT || 3000;
 const USER_ID = process.env.USER_ID; // Your Supabase user ID for automation
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+// Use service role key to bypass RLS (server is trusted, inserts on behalf of users)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // Gmail OAuth2 client setup
 const oauth2Client = new google.auth.OAuth2(
@@ -607,7 +608,7 @@ app.listen(PORT, () => {
 ║  STATUS:                                                   ║
 ║  • Gmail: ${process.env.GMAIL_REFRESH_TOKEN ? '✅ Connected' : '❌ Not connected - visit /auth/google'}       ║
 ║  • Slack: ${process.env.SLACK_SIGNING_SECRET ? '✅ Configured' : '⚠️  Not configured'}                        ║
-║  • Supabase: ${process.env.SUPABASE_URL ? '✅ Configured' : '❌ Missing SUPABASE_URL'}                     ║
+║  • Supabase: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ Configured' : '❌ Missing SUPABASE_SERVICE_ROLE_KEY'}                     ║
 ╚════════════════════════════════════════════════════════════╝
   `);
 });
