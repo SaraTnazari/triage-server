@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
+import { v4 as uuidv4 } from 'uuid';
+
 
 console.log("🚀 STARTING THE ENGINE...");
 
@@ -9,6 +11,7 @@ async function simpleTest() {
   console.log("📡 Sending test data to Supabase...");
   
   const testData = {
+    id: uuidv4(),
     sender: "Test Pilot",
     summary: "The engine is officially working!",
     url: "https://apple.com/" + Math.random()
