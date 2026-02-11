@@ -272,7 +272,7 @@ app.post('/gmail/webhook', async (req, res) => {
     const decoded = JSON.parse(Buffer.from(data, 'base64').toString());
     console.log('📨 Gmail notification:', decoded);
 
-    const { emailAddress, historyId } = decoded;
+    const { emailAddress } = decoded;
 
     // Look up user by email address
     const { data: tokenRecord, error: lookupError } = await supabase
@@ -292,43 +292,45 @@ app.post('/gmail/webhook', async (req, res) => {
     const userAuth = createUserOAuth2Client(refresh_token);
     const userGmail = google.gmail({ version: 'v1', auth: userAuth });
 
-    // Fetch recent history
-    const history = await userGmail.users.history.list({
+    // Fetch recent messages (simpler approach - just sync last 5 messages)
+    const response = await userGmail.users.messages.list({
       userId: 'me',
-      startHistoryId: historyId,
-      historyTypes: ['messageAdded']
+      labelIds: ['INBOX'],
+      maxResults: 5
     });
 
-    for (const historyItem of (history.data.history || [])) {
-      for (const added of (historyItem.messagesAdded || [])) {
-        const messageId = added.message.id;
+    const messages = response.data.messages || [];
+    let processed = 0;
 
-        const message = await userGmail.users.messages.get({
-          userId: 'me',
-          id: messageId,
-          format: 'metadata',
-          metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
-        });
+    for (const msg of messages) {
+      const message = await userGmail.users.messages.get({
+        userId: 'me',
+        id: msg.id,
+        format: 'metadata',
+        metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
+      });
 
-        const labelIds = message.data.labelIds || [];
-        if (!labelIds.includes('UNREAD')) continue;
+      const headers = extractEmailHeaders(message.data);
+      const senderName = parseSenderName(headers.from);
+      const labelIds = message.data.labelIds || [];
 
-        const headers = extractEmailHeaders(message.data);
-        const senderName = parseSenderName(headers.from);
+      // Check if email should be included (not promotion/spam)
+      if (!shouldIncludeEmail(headers.from, labelIds)) continue;
 
-        if (!shouldIncludeEmail(headers.from, labelIds)) continue;
+      // Try to save - duplicate protection will prevent re-adding existing emails
+      const result = await saveToSupabase({
+        sender: senderName,
+        summary: headers.subject || '(No Subject)',
+        url: createGmailLink(msg.id),
+        platform: 'gmail',
+        messageId: headers.messageId || msg.id,
+        user_id: user_id
+      });
 
-        await saveToSupabase({
-          sender: senderName,
-          summary: headers.subject || '(No Subject)',
-          url: createGmailLink(messageId),
-          platform: 'gmail',
-          messageId: headers.messageId || messageId,
-          user_id: user_id
-        });
-      }
+      if (!result.skipped) processed++;
     }
 
+    console.log(`✅ Webhook processed ${processed} new emails for ${emailAddress}`);
     res.status(200).send('OK');
   } catch (error) {
     console.error('Gmail webhook error:', error);
