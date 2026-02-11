@@ -475,14 +475,44 @@ app.get('/auth/slack', (req, res) => {
   }
 
   const state = Buffer.from(JSON.stringify({ user_id })).toString('base64');
+  const redirectUri = process.env.SLACK_REDIRECT_URI || `http://localhost:${PORT}/auth/slack/callback`;
 
-  const slackAuthUrl = `https://slack.com/oauth/v2/authorize?` +
-    `client_id=${process.env.SLACK_CLIENT_ID}&` +
-    `scope=users:read,im:history,im:read&` +
-    `redirect_uri=${encodeURIComponent(process.env.SLACK_REDIRECT_URI || `http://localhost:${PORT}/auth/slack/callback`)}&` +
-    `state=${state}`;
+  const params = new URLSearchParams({
+    client_id: process.env.SLACK_CLIENT_ID,
+    scope: 'channels:read,im:history,im:read,users:read',
+    redirect_uri: redirectUri,
+    state: state
+  });
 
+  const slackAuthUrl = `https://slack.com/oauth/v2/authorize?${params.toString()}`;
+  console.log('🔗 Slack OAuth URL:', slackAuthUrl);
   res.redirect(slackAuthUrl);
+});
+
+/**
+ * GET /auth/slack/test?user_id=UUID
+ * Debug endpoint — shows the Slack OAuth URL instead of redirecting
+ */
+app.get('/auth/slack/test', (req, res) => {
+  const user_id = req.query.user_id || 'test-user-id';
+  const state = Buffer.from(JSON.stringify({ user_id })).toString('base64');
+  const redirectUri = process.env.SLACK_REDIRECT_URI || `http://localhost:${PORT}/auth/slack/callback`;
+
+  const params = new URLSearchParams({
+    client_id: process.env.SLACK_CLIENT_ID,
+    scope: 'channels:read,im:history,im:read,users:read',
+    redirect_uri: redirectUri,
+    state: state
+  });
+
+  const slackAuthUrl = `https://slack.com/oauth/v2/authorize?${params.toString()}`;
+  res.json({
+    url: slackAuthUrl,
+    client_id: process.env.SLACK_CLIENT_ID,
+    redirect_uri: redirectUri,
+    scopes: 'channels:read,im:history,im:read,users:read',
+    state: state
+  });
 });
 
 /**
