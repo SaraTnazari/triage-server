@@ -1,12 +1,15 @@
 /**
- * Communication Triage Automation Server
+ * Communication Triage Automation Server (Multi-User)
  *
  * This server automatically captures incoming emails and Slack DMs,
  * saving them to your Supabase pending_actions table for triage.
  *
+ * Each user connects their own Gmail and Slack through the Chrome extension.
+ * Tokens are stored per-user in Supabase tables.
+ *
  * Features:
- * - Gmail API push notifications (real-time email alerts)
- * - Slack webhook for DMs
+ * - Per-user Gmail OAuth + push notifications
+ * - Per-user Slack OAuth + DM webhook
  * - Duplicate protection (won't add the same message twice)
  * - Direct "magic" links to open emails/messages with one click
  */
@@ -21,38 +24,20 @@ import crypto from 'crypto';
 // CONFIGURATION
 // ============================================
 const PORT = process.env.PORT || 3000;
-const USER_ID = process.env.USER_ID; // Your Supabase user ID for automation
-// Use service role key to bypass RLS (server is trusted, inserts on behalf of users)
+
+// Service role key bypasses RLS (server is trusted, inserts on behalf of users)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-// Gmail OAuth2 client setup
+// Gmail OAuth2 client (shared config, per-user tokens)
 const oauth2Client = new google.auth.OAuth2(
   process.env.GMAIL_CLIENT_ID,
   process.env.GMAIL_CLIENT_SECRET,
   process.env.GMAIL_REDIRECT_URI || `http://localhost:${PORT}/auth/google/callback`
 );
 
-// Set credentials if refresh token exists
-if (process.env.GMAIL_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({
-    refresh_token: process.env.GMAIL_REFRESH_TOKEN
-  });
-}
-
-const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
 // ============================================
 // EMAIL FILTER CONFIGURATION
 // ============================================
-// Add domains/emails you want to ALWAYS see (VIP list)
-// Examples: '@yourcompany.com', 'boss@gmail.com', 'client@important.com'
-const VIP_SENDERS = [
-  // '@yourcompany.com',  // Uncomment and edit to add your work domain
-  // 'important@person.com',  // Uncomment and add specific emails
-];
-
-// Gmail labels to EXCLUDE (promotional/spam categories)
-// These are Gmail's category labels - emails with these labels will be filtered out
 const EXCLUDED_LABELS = [
   'CATEGORY_PROMOTIONS',
   'CATEGORY_SOCIAL',
@@ -62,43 +47,24 @@ const EXCLUDED_LABELS = [
   'TRASH'
 ];
 
-/**
- * Check if an email should be included in triage
- * Returns true if: sender is VIP OR email is in Primary inbox (not promotions/social/etc)
- */
 function shouldIncludeEmail(senderEmail, labelIds = []) {
-  // Always include VIP senders
-  const senderLower = (senderEmail || '').toLowerCase();
-  for (const vip of VIP_SENDERS) {
-    if (vip && senderLower.includes(vip.toLowerCase())) {
-      return true;
-    }
-  }
-
-  // Exclude if email has any of the excluded labels (promotions, social, etc)
   for (const excludedLabel of EXCLUDED_LABELS) {
     if (labelIds.includes(excludedLabel)) {
       console.log(`⏭️  Filtered out (${excludedLabel}): ${senderEmail}`);
       return false;
     }
   }
-
-  // Include if it's in INBOX and passed the label filter
   return labelIds.includes('INBOX');
 }
 
 const app = express();
 
-// CORS - Allow requests from Chrome extension and any origin
+// CORS - Allow requests from Chrome extension
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, apikey');
-
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
@@ -109,51 +75,47 @@ app.use(express.json());
 // ============================================
 
 /**
+ * Create an OAuth2Client for a specific user using their stored refresh token
+ */
+function createUserOAuth2Client(refreshToken) {
+  const userClient = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET,
+    process.env.GMAIL_REDIRECT_URI || `http://localhost:${PORT}/auth/google/callback`
+  );
+  userClient.setCredentials({ refresh_token: refreshToken });
+  return userClient;
+}
+
+/**
  * Check if a message already exists in the database (duplicate protection)
- * Uses message_link (URL) to detect duplicates
  */
 async function isDuplicate(messageLink, platform) {
   if (!messageLink) return false;
-
   const { data, error } = await supabase
     .from('pending_actions')
     .select('id')
     .eq('message_link', messageLink)
     .eq('platform_tag', platform)
     .limit(1);
-
   if (error) {
     console.error('Error checking for duplicate:', error);
-    return false; // Allow insert on error to not lose messages
+    return false;
   }
-
   return data && data.length > 0;
 }
 
-/**
- * Create a direct Gmail link for the message
- */
 function createGmailLink(messageId) {
-  // Gmail web link format
   return `https://mail.google.com/mail/u/0/#inbox/${messageId}`;
 }
 
-/**
- * Create a direct Slack link for the message
- */
 function createSlackLink(teamId, channelId, messageTs) {
-  // Slack deep link format
-  const tsFormatted = messageTs.replace('.', '');
   return `https://slack.com/app_redirect?team=${teamId}&channel=${channelId}&message_ts=${messageTs}`;
 }
 
-/**
- * Extract email headers from Gmail message
- */
 function extractEmailHeaders(message) {
   const headers = message.payload?.headers || [];
   const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
-
   return {
     from: getHeader('From'),
     subject: getHeader('Subject'),
@@ -162,39 +124,24 @@ function extractEmailHeaders(message) {
   };
 }
 
-/**
- * Parse sender name from email "From" header
- * e.g., "John Doe <john@example.com>" -> "John Doe"
- */
 function parseSenderName(fromHeader) {
   if (!fromHeader) return 'Unknown Sender';
-
-  // Try to extract name before email
   const match = fromHeader.match(/^(.+?)\s*<.+>$/);
-  if (match) {
-    return match[1].replace(/"/g, '').trim();
-  }
-
-  // If no name, extract email
+  if (match) return match[1].replace(/"/g, '').trim();
   const emailMatch = fromHeader.match(/<(.+)>/);
-  if (emailMatch) {
-    return emailMatch[1];
-  }
-
+  if (emailMatch) return emailMatch[1];
   return fromHeader;
 }
 
 /**
- * Save a message to Supabase
+ * Save a message to Supabase (multi-user: requires user_id)
  */
-async function saveToSupabase({ sender, summary, url, platform, messageId }) {
-  // Check for duplicates first (using message_link/URL)
+async function saveToSupabase({ sender, summary, url, platform, messageId, user_id }) {
   if (await isDuplicate(url, platform)) {
     console.log(`⏭️  Skipping duplicate: ${url}`);
     return { skipped: true, reason: 'duplicate' };
   }
 
-  // Combine sender and summary into task_text
   const task_text = `${sender}: ${summary}`;
 
   const { data, error } = await supabase
@@ -204,7 +151,7 @@ async function saveToSupabase({ sender, summary, url, platform, messageId }) {
       platform_tag: platform,
       sender_name: sender,
       message_link: url,
-      user_id: USER_ID
+      user_id: user_id
     }])
     .select();
 
@@ -213,28 +160,34 @@ async function saveToSupabase({ sender, summary, url, platform, messageId }) {
     throw error;
   }
 
-  console.log(`✅ Saved: ${task_text.substring(0, 60)}...`);
+  console.log(`✅ Saved for user ${user_id}: ${task_text.substring(0, 60)}...`);
   return { data, skipped: false };
 }
 
 // ============================================
-// GMAIL INTEGRATION
+// GMAIL OAUTH (per-user)
 // ============================================
 
 /**
- * GET /auth/google
- * Start Google OAuth flow to get Gmail access
+ * GET /auth/google?user_id=UUID
+ * Start Google OAuth flow — user_id is encoded in state
  */
 app.get('/auth/google', (req, res) => {
-  const scopes = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.metadata'
-  ];
+  const { user_id } = req.query;
+  if (!user_id) {
+    return res.status(400).send('Missing user_id parameter. Connect Gmail from the extension.');
+  }
+
+  const state = Buffer.from(JSON.stringify({ user_id })).toString('base64');
 
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
-    scope: scopes,
-    prompt: 'consent' // Force consent to get refresh token
+    scope: [
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.metadata'
+    ],
+    prompt: 'consent',
+    state: state
   });
 
   res.redirect(authUrl);
@@ -242,41 +195,251 @@ app.get('/auth/google', (req, res) => {
 
 /**
  * GET /auth/google/callback
- * Handle OAuth callback and store tokens
+ * Handle OAuth callback — store refresh token per user in Supabase
  */
 app.get('/auth/google/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
 
   try {
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
+    // Decode user_id from state
+    const { user_id } = JSON.parse(Buffer.from(state, 'base64').toString());
 
-    console.log('\n🔑 GMAIL TOKENS RECEIVED!');
-    console.log('Add this to your .env file:');
-    console.log(`GMAIL_REFRESH_TOKEN=${tokens.refresh_token}`);
-    console.log('');
+    const { tokens } = await oauth2Client.getToken(code);
+
+    // Create a temporary client to get the user's email
+    const tempClient = createUserOAuth2Client(tokens.refresh_token);
+    const tempGmail = google.gmail({ version: 'v1', auth: tempClient });
+    const profile = await tempGmail.users.getProfile({ userId: 'me' });
+    const emailAddress = profile.data.emailAddress;
+
+    // Store in database
+    const { error } = await supabase
+      .from('user_gmail_tokens')
+      .upsert({
+        user_id,
+        email_address: emailAddress,
+        refresh_token: tokens.refresh_token
+      }, { onConflict: 'email_address' });
+
+    if (error) {
+      console.error('Error storing Gmail token:', error);
+      throw error;
+    }
+
+    console.log(`✅ Gmail connected for ${emailAddress} (user: ${user_id})`);
 
     res.send(`
-      <h1>Gmail Connected!</h1>
-      <p>Add this refresh token to your .env file:</p>
-      <code style="background:#f0f0f0;padding:10px;display:block;word-break:break-all;">
-        GMAIL_REFRESH_TOKEN=${tokens.refresh_token}
-      </code>
-      <p>Then restart the server and call <code>POST /gmail/watch</code> to start listening for emails.</p>
+      <html>
+      <body style="font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: white;">
+        <div style="text-align: center;">
+          <h1>Gmail Connected!</h1>
+          <p>Connected: ${emailAddress}</p>
+          <p style="color: #888;">You can close this window and go back to the extension.</p>
+        </div>
+      </body>
+      </html>
     `);
   } catch (error) {
-    console.error('OAuth error:', error);
-    res.status(500).send('Authentication failed: ' + error.message);
+    console.error('Gmail OAuth error:', error);
+    res.status(500).send(`
+      <html>
+      <body style="font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: white;">
+        <div style="text-align: center;">
+          <h1>Connection Failed</h1>
+          <p style="color: #ff6b6b;">${error.message}</p>
+          <p style="color: #888;">Please try again from the extension.</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// ============================================
+// GMAIL WEBHOOK (multi-user)
+// ============================================
+
+/**
+ * POST /gmail/webhook
+ * Receive push notifications from Gmail via Pub/Sub
+ * Looks up user by email address from the notification
+ */
+app.post('/gmail/webhook', async (req, res) => {
+  try {
+    const data = req.body.message?.data;
+    if (!data) return res.status(200).send('No data');
+
+    const decoded = JSON.parse(Buffer.from(data, 'base64').toString());
+    console.log('📨 Gmail notification:', decoded);
+
+    const { emailAddress, historyId } = decoded;
+
+    // Look up user by email address
+    const { data: tokenRecord, error: lookupError } = await supabase
+      .from('user_gmail_tokens')
+      .select('user_id, refresh_token')
+      .eq('email_address', emailAddress)
+      .single();
+
+    if (lookupError || !tokenRecord) {
+      console.log(`❌ No user found for email: ${emailAddress}`);
+      return res.status(200).send('OK');
+    }
+
+    const { user_id, refresh_token } = tokenRecord;
+
+    // Create OAuth client for this user
+    const userAuth = createUserOAuth2Client(refresh_token);
+    const userGmail = google.gmail({ version: 'v1', auth: userAuth });
+
+    // Fetch recent history
+    const history = await userGmail.users.history.list({
+      userId: 'me',
+      startHistoryId: historyId,
+      historyTypes: ['messageAdded']
+    });
+
+    for (const historyItem of (history.data.history || [])) {
+      for (const added of (historyItem.messagesAdded || [])) {
+        const messageId = added.message.id;
+
+        const message = await userGmail.users.messages.get({
+          userId: 'me',
+          id: messageId,
+          format: 'metadata',
+          metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
+        });
+
+        const labelIds = message.data.labelIds || [];
+        if (!labelIds.includes('UNREAD')) continue;
+
+        const headers = extractEmailHeaders(message.data);
+        const senderName = parseSenderName(headers.from);
+
+        if (!shouldIncludeEmail(headers.from, labelIds)) continue;
+
+        await saveToSupabase({
+          sender: senderName,
+          summary: headers.subject || '(No Subject)',
+          url: createGmailLink(messageId),
+          platform: 'gmail',
+          messageId: headers.messageId || messageId,
+          user_id: user_id
+        });
+      }
+    }
+
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('Gmail webhook error:', error);
+    res.status(200).send('Error logged');
+  }
+});
+
+/**
+ * POST /gmail/sync
+ * Manually sync recent emails for a specific user
+ */
+app.post('/gmail/sync', async (req, res) => {
+  try {
+    const { user_id, maxResults = 10 } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({ error: 'Missing user_id' });
+    }
+
+    // Get user's Gmail token
+    const { data: tokenRecord } = await supabase
+      .from('user_gmail_tokens')
+      .select('refresh_token, email_address')
+      .eq('user_id', user_id)
+      .single();
+
+    if (!tokenRecord) {
+      return res.status(404).json({ error: 'Gmail not connected for this user' });
+    }
+
+    const userAuth = createUserOAuth2Client(tokenRecord.refresh_token);
+    const userGmail = google.gmail({ version: 'v1', auth: userAuth });
+
+    const response = await userGmail.users.messages.list({
+      userId: 'me',
+      labelIds: ['INBOX'],
+      maxResults
+    });
+
+    const messages = response.data.messages || [];
+    const results = [];
+    let filtered = 0;
+
+    for (const msg of messages) {
+      const message = await userGmail.users.messages.get({
+        userId: 'me',
+        id: msg.id,
+        format: 'metadata',
+        metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
+      });
+
+      const headers = extractEmailHeaders(message.data);
+      const senderName = parseSenderName(headers.from);
+      const labelIds = message.data.labelIds || [];
+
+      if (!shouldIncludeEmail(headers.from, labelIds)) {
+        filtered++;
+        continue;
+      }
+
+      const result = await saveToSupabase({
+        sender: senderName,
+        summary: headers.subject || '(No Subject)',
+        url: createGmailLink(msg.id),
+        platform: 'gmail',
+        messageId: headers.messageId || msg.id,
+        user_id: user_id
+      });
+
+      results.push({ sender: senderName, subject: headers.subject, ...result });
+    }
+
+    res.json({
+      success: true,
+      processed: results.length,
+      filtered,
+      message: `Added ${results.length} emails, filtered out ${filtered} promotional/social`,
+      results
+    });
+  } catch (error) {
+    console.error('Gmail sync error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
 /**
  * POST /gmail/watch
- * Set up Gmail push notifications via Pub/Sub
+ * Set up Gmail push notifications for a specific user
  */
 app.post('/gmail/watch', async (req, res) => {
   try {
-    const response = await gmail.users.watch({
+    const { user_id } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({ error: 'Missing user_id' });
+    }
+
+    const { data: tokenRecord } = await supabase
+      .from('user_gmail_tokens')
+      .select('refresh_token')
+      .eq('user_id', user_id)
+      .single();
+
+    if (!tokenRecord) {
+      return res.status(404).json({ error: 'Gmail not connected for this user' });
+    }
+
+    const userAuth = createUserOAuth2Client(tokenRecord.refresh_token);
+    const userGmail = google.gmail({ version: 'v1', auth: userAuth });
+
+    const response = await userGmail.users.watch({
       userId: 'me',
       requestBody: {
         topicName: process.env.GMAIL_PUBSUB_TOPIC,
@@ -284,7 +447,7 @@ app.post('/gmail/watch', async (req, res) => {
       }
     });
 
-    console.log('📬 Gmail watch started:', response.data);
+    console.log(`📬 Gmail watch started for user ${user_id}:`, response.data);
     res.json({
       success: true,
       message: 'Gmail watch activated',
@@ -297,161 +460,116 @@ app.post('/gmail/watch', async (req, res) => {
   }
 });
 
+// ============================================
+// SLACK OAUTH (per-user)
+// ============================================
+
 /**
- * POST /gmail/webhook
- * Receive push notifications from Gmail via Pub/Sub
+ * GET /auth/slack?user_id=UUID
+ * Start Slack OAuth flow — user_id is encoded in state
  */
-app.post('/gmail/webhook', async (req, res) => {
-  try {
-    // Pub/Sub sends base64-encoded data
-    const data = req.body.message?.data;
-    if (!data) {
-      return res.status(200).send('No data');
-    }
-
-    const decoded = JSON.parse(Buffer.from(data, 'base64').toString());
-    console.log('📨 Gmail notification:', decoded);
-
-    const { emailAddress, historyId } = decoded;
-
-    // Fetch recent history to get new messages
-    const history = await gmail.users.history.list({
-      userId: 'me',
-      startHistoryId: historyId,
-      historyTypes: ['messageAdded']
-    });
-
-    const messages = history.data.history || [];
-
-    for (const historyItem of messages) {
-      for (const added of (historyItem.messagesAdded || [])) {
-        const messageId = added.message.id;
-
-        // Fetch full message details
-        const message = await gmail.users.messages.get({
-          userId: 'me',
-          id: messageId,
-          format: 'metadata',
-          metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
-        });
-
-        const labelIds = message.data.labelIds || [];
-
-        // Only process unread messages in inbox
-        if (!labelIds.includes('UNREAD')) {
-          continue;
-        }
-
-        const headers = extractEmailHeaders(message.data);
-        const senderName = parseSenderName(headers.from);
-
-        // Apply email filter (skip promotions, social, etc.)
-        if (!shouldIncludeEmail(headers.from, labelIds)) {
-          continue;
-        }
-
-        await saveToSupabase({
-          sender: senderName,
-          summary: headers.subject || '(No Subject)',
-          url: createGmailLink(messageId),
-          platform: 'gmail',
-          messageId: headers.messageId || messageId
-        });
-      }
-    }
-
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('Gmail webhook error:', error);
-    res.status(200).send('Error logged'); // Return 200 to prevent Pub/Sub retries
+app.get('/auth/slack', (req, res) => {
+  const { user_id } = req.query;
+  if (!user_id) {
+    return res.status(400).send('Missing user_id parameter. Connect Slack from the extension.');
   }
+
+  const state = Buffer.from(JSON.stringify({ user_id })).toString('base64');
+
+  const slackAuthUrl = `https://slack.com/oauth/v2/authorize?` +
+    `client_id=${process.env.SLACK_CLIENT_ID}&` +
+    `scope=users:read,im:history,im:read&` +
+    `redirect_uri=${encodeURIComponent(process.env.SLACK_REDIRECT_URI || `http://localhost:${PORT}/auth/slack/callback`)}&` +
+    `state=${state}`;
+
+  res.redirect(slackAuthUrl);
 });
 
 /**
- * POST /gmail/sync
- * Manually sync recent unread emails (useful for testing)
- * Filters out promotional/social emails, only shows Primary inbox + VIP senders
+ * GET /auth/slack/callback
+ * Handle Slack OAuth callback — store bot token per user
  */
-app.post('/gmail/sync', async (req, res) => {
-  try {
-    const { maxResults = 10 } = req.body;
+app.get('/auth/slack/callback', async (req, res) => {
+  const { code, state } = req.query;
 
-    // Fetch recent messages from inbox
-    const response = await gmail.users.messages.list({
-      userId: 'me',
-      labelIds: ['INBOX'],
-      maxResults
+  try {
+    const { user_id } = JSON.parse(Buffer.from(state, 'base64').toString());
+
+    // Exchange code for token
+    const response = await fetch('https://slack.com/api/oauth.v2.access', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: process.env.SLACK_CLIENT_ID,
+        client_secret: process.env.SLACK_CLIENT_SECRET,
+        code: code,
+        redirect_uri: process.env.SLACK_REDIRECT_URI || `http://localhost:${PORT}/auth/slack/callback`
+      })
     });
 
-    const messages = response.data.messages || [];
-    const results = [];
-    let filtered = 0;
+    const data = await response.json();
 
-    for (const msg of messages) {
-      const message = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id,
-        format: 'metadata',
-        metadataHeaders: ['From', 'Subject', 'Date', 'Message-ID']
-      });
-
-      const headers = extractEmailHeaders(message.data);
-      const senderName = parseSenderName(headers.from);
-      const labelIds = message.data.labelIds || [];
-
-      // Apply email filter (skip promotions, social, etc.)
-      if (!shouldIncludeEmail(headers.from, labelIds)) {
-        filtered++;
-        continue;
-      }
-
-      const result = await saveToSupabase({
-        sender: senderName,
-        summary: headers.subject || '(No Subject)',
-        url: createGmailLink(msg.id),
-        platform: 'gmail',
-        messageId: headers.messageId || msg.id
-      });
-
-      results.push({
-        sender: senderName,
-        subject: headers.subject,
-        ...result
-      });
+    if (!data.ok) {
+      throw new Error(data.error);
     }
 
-    res.json({
-      success: true,
-      processed: results.length,
-      filtered: filtered,
-      message: `Added ${results.length} emails, filtered out ${filtered} promotional/social`,
-      results
-    });
+    // Store token in database
+    const { error } = await supabase
+      .from('user_slack_tokens')
+      .upsert({
+        user_id,
+        team_id: data.team.id,
+        team_name: data.team.name,
+        bot_token: data.access_token
+      }, { onConflict: 'user_id,team_id' });
+
+    if (error) {
+      console.error('Error storing Slack token:', error);
+      throw error;
+    }
+
+    console.log(`✅ Slack connected for workspace "${data.team.name}" (user: ${user_id})`);
+
+    res.send(`
+      <html>
+      <body style="font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: white;">
+        <div style="text-align: center;">
+          <h1>Slack Connected!</h1>
+          <p>Workspace: ${data.team.name}</p>
+          <p style="color: #888;">You can close this window and go back to the extension.</p>
+        </div>
+      </body>
+      </html>
+    `);
   } catch (error) {
-    console.error('Gmail sync error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Slack OAuth error:', error);
+    res.status(500).send(`
+      <html>
+      <body style="font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: white;">
+        <div style="text-align: center;">
+          <h1>Connection Failed</h1>
+          <p style="color: #ff6b6b;">${error.message}</p>
+          <p style="color: #888;">Please try again from the extension.</p>
+        </div>
+      </body>
+      </html>
+    `);
   }
 });
 
 // ============================================
-// SLACK INTEGRATION
+// SLACK WEBHOOK (multi-user)
 // ============================================
 
-/**
- * Verify Slack request signature
- */
 function verifySlackSignature(req) {
   const slackSigningSecret = process.env.SLACK_SIGNING_SECRET;
-  if (!slackSigningSecret) return true; // Skip verification if not configured
+  if (!slackSigningSecret) return true;
 
   const timestamp = req.headers['x-slack-request-timestamp'];
   const signature = req.headers['x-slack-signature'];
 
-  // Prevent replay attacks (request older than 5 minutes)
   const fiveMinutesAgo = Math.floor(Date.now() / 1000) - 60 * 5;
-  if (parseInt(timestamp) < fiveMinutesAgo) {
-    return false;
-  }
+  if (parseInt(timestamp) < fiveMinutesAgo) return false;
 
   const sigBasestring = 'v0:' + timestamp + ':' + JSON.stringify(req.body);
   const mySignature = 'v0=' + crypto
@@ -467,15 +585,13 @@ function verifySlackSignature(req) {
 
 /**
  * POST /slack/webhook
- * Receive events from Slack Event Subscriptions
+ * Receive events from Slack — looks up user by team_id
  */
 app.post('/slack/webhook', async (req, res) => {
-  // Handle Slack URL verification challenge
   if (req.body.type === 'url_verification') {
     return res.json({ challenge: req.body.challenge });
   }
 
-  // Verify request is from Slack
   if (!verifySlackSignature(req)) {
     console.warn('⚠️ Invalid Slack signature');
     return res.status(401).send('Invalid signature');
@@ -483,9 +599,7 @@ app.post('/slack/webhook', async (req, res) => {
 
   const event = req.body.event;
 
-  // Only process direct messages (DMs)
   if (event?.type === 'message' && event?.channel_type === 'im') {
-    // Ignore bot messages and message edits
     if (event.bot_id || event.subtype) {
       return res.status(200).send('OK');
     }
@@ -494,37 +608,49 @@ app.post('/slack/webhook', async (req, res) => {
       const teamId = req.body.team_id;
       const channelId = event.channel;
       const messageTs = event.ts;
-      const userId = event.user;
+      const slackUserId = event.user;
       const text = event.text || '(No message text)';
 
-      // Get user info for sender name
-      let senderName = userId;
-      if (process.env.SLACK_BOT_TOKEN) {
-        try {
-          const userResponse = await fetch(`https://slack.com/api/users.info?user=${userId}`, {
-            headers: { 'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}` }
-          });
-          const userData = await userResponse.json();
-          if (userData.ok) {
-            senderName = userData.user?.real_name || userData.user?.name || userId;
-          }
-        } catch (e) {
-          console.warn('Could not fetch user info:', e);
-        }
+      // Look up which user owns this workspace
+      const { data: tokenRecord } = await supabase
+        .from('user_slack_tokens')
+        .select('user_id, bot_token')
+        .eq('team_id', teamId)
+        .single();
+
+      if (!tokenRecord) {
+        console.log(`❌ No user found for Slack team: ${teamId}`);
+        return res.status(200).send('OK');
       }
 
-      // Create summary from message (truncate if too long)
+      const { user_id, bot_token } = tokenRecord;
+
+      // Get sender name using this user's bot token
+      let senderName = slackUserId;
+      try {
+        const userResponse = await fetch(`https://slack.com/api/users.info?user=${slackUserId}`, {
+          headers: { 'Authorization': `Bearer ${bot_token}` }
+        });
+        const userData = await userResponse.json();
+        if (userData.ok) {
+          senderName = userData.user?.real_name || userData.user?.name || slackUserId;
+        }
+      } catch (e) {
+        console.warn('Could not fetch Slack user info:', e);
+      }
+
       const summary = text.length > 100 ? text.substring(0, 100) + '...' : text;
 
       await saveToSupabase({
         sender: senderName,
-        summary: summary,
+        summary,
         url: createSlackLink(teamId, channelId, messageTs),
         platform: 'slack',
-        messageId: `${teamId}-${channelId}-${messageTs}`
+        messageId: `${teamId}-${channelId}-${messageTs}`,
+        user_id: user_id
       });
 
-      console.log(`💬 Slack DM from ${senderName}: ${summary.substring(0, 50)}...`);
+      console.log(`💬 Slack DM for user ${user_id} from ${senderName}: ${summary.substring(0, 50)}...`);
     } catch (error) {
       console.error('Slack processing error:', error);
     }
@@ -537,53 +663,14 @@ app.post('/slack/webhook', async (req, res) => {
 // UTILITY ENDPOINTS
 // ============================================
 
-/**
- * GET /health
- * Health check endpoint
- */
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    gmail: !!process.env.GMAIL_REFRESH_TOKEN,
-    slack: !!process.env.SLACK_SIGNING_SECRET
+    supabase: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    gmail_oauth: !!process.env.GMAIL_CLIENT_ID,
+    slack_oauth: !!process.env.SLACK_CLIENT_ID
   });
-});
-
-/**
- * GET /pending
- * Get all pending actions (for testing)
- */
-app.get('/pending', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('pending_actions')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * DELETE /pending/:id
- * Delete a pending action
- */
-app.delete('/pending/:id', async (req, res) => {
-  try {
-    const { error } = await supabase
-      .from('pending_actions')
-      .delete()
-      .eq('id', req.params.id);
-
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
 });
 
 // ============================================
@@ -592,23 +679,23 @@ app.delete('/pending/:id', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║      🎯 Communication Triage Server Running                ║
+║      Communication Triage Server (Multi-User)              ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server: http://localhost:${PORT}                             ║
 ║                                                            ║
 ║  ENDPOINTS:                                                ║
-║  • GET  /auth/google      - Start Gmail OAuth              ║
-║  • POST /gmail/watch      - Enable Gmail push              ║
-║  • POST /gmail/webhook    - Gmail push notifications       ║
-║  • POST /gmail/sync       - Manual email sync              ║
-║  • POST /slack/webhook    - Slack event receiver           ║
-║  • GET  /health           - Health check                   ║
-║  • GET  /pending          - List pending actions           ║
+║  • GET  /auth/google       - Gmail OAuth (per user)        ║
+║  • GET  /auth/slack        - Slack OAuth (per user)        ║
+║  • POST /gmail/webhook     - Gmail push notifications      ║
+║  • POST /gmail/sync        - Manual email sync             ║
+║  • POST /gmail/watch       - Enable Gmail push             ║
+║  • POST /slack/webhook     - Slack event receiver          ║
+║  • GET  /health            - Health check                  ║
 ║                                                            ║
 ║  STATUS:                                                   ║
-║  • Gmail: ${process.env.GMAIL_REFRESH_TOKEN ? '✅ Connected' : '❌ Not connected - visit /auth/google'}       ║
-║  • Slack: ${process.env.SLACK_SIGNING_SECRET ? '✅ Configured' : '⚠️  Not configured'}                        ║
-║  • Supabase: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ Configured' : '❌ Missing SUPABASE_SERVICE_ROLE_KEY'}                     ║
+║  • Supabase: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? '✅ Connected' : '❌ Missing'}                              ║
+║  • Gmail OAuth: ${process.env.GMAIL_CLIENT_ID ? '✅ Configured' : '❌ Missing GMAIL_CLIENT_ID'}                       ║
+║  • Slack OAuth: ${process.env.SLACK_CLIENT_ID ? '✅ Configured' : '⚠️  Not configured'}                       ║
 ╚════════════════════════════════════════════════════════════╝
   `);
 });
